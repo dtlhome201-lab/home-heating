@@ -143,6 +143,10 @@ td.r, th.r{text-align:right}
         <select id="gu" aria-label="구·군"></select>
       </div>
       <span class="hint" id="regionHint"></span>
+      <div class="row">
+        <label class="fld">검침일 매월 <input class="t" type="number" id="billDay" step="1" min="1" max="28" style="width:3.4em"> 일</label>
+      </div>
+      <span class="hint" id="billHint"></span>
     </div>
 
     <div class="grp">
@@ -232,7 +236,9 @@ td.r, th.r{text-align:right}
           <ol>
             <li><b>집 특성 학습:</b> 운전 설정을 바꾼 날 이전의 검침값을 7일 이상 단위로 자동으로 묶어, 하루 사용량 = α + β × 난방도일(외기온도가 τ보다 낮은 만큼) 관계를 찾습니다. PRISM(Princeton Scorekeeping Method) 방식이며 근거는 Fels, “PRISM: An Introduction”, <i>Energy and Buildings</i> 9(1–2), 1986.</li>
             <li><b>자동 보정:</b> 설정을 바꾼 날 이후의 기록은 학습에 쓰지 않고, 예측과 실제의 차이를 재서 남은 기간 예측에 반영합니다. 기록이 적을 때는 조금만, 쌓일수록 크게 반영됩니다.</li>
-            <li><b>실내온도:</b> 실내를 1°C 올리면 난방이 필요한 외기온도 기준(τ)도 1°C 올라간다고 봅니다.</li>
+            <li><b>실내온도 기준:</b> 실내온도를 정해 두고 필요할 때만 가동합니다. 실내를 1°C 올리면 난방이 필요한 외기온도 기준(τ)도 1°C 올라간다고 봅니다.</li>
+            <li><b>난방수온도 기준:</b> 난방수를 계속 돌리므로 실내온도는 입력값이 아니라 결과입니다. 바닥이 내는 열 = r·β·(평균 수온 − 실내), 집이 잃는 열 = β·(실내 − δ − 외기)가 같아지는 실내온도를 구하고, 사용량은 β·r/(1+r)·(평균 수온 − δ − 외기)로 계산합니다(평균 수온 = 난방수 − 5°C). 그래서 따뜻한 날에도 가스를 쓰고, 추운 날엔 실내가 내려갑니다. r의 초기값 0.8은 10/31 밤 40°C 실측에서 잡았고, 기록이 쌓이면 자동 보정됩니다.</li>
+            <li><b>검침일:</b> 월별 금액을 매월 검침일부터 다음 검침일 전날까지로 나눠 계산합니다. 고지서와 같은 기간으로 비교하려면 검침일을 맞춰 주세요.</li>
             <li><b>난방수 온도:</b> 콘덴싱 보일러는 환수 온도가 낮을수록 배기 수증기가 응축돼 효율이 오릅니다. 난방수 50°C와 70°C 효율 사이를 직선으로 잇습니다.</li>
             <li><b>외기온도:</b> 기상청 날씨누리 과거관측(ASOS 일평균기온). GitHub Actions가 매일 새벽 자동으로 받아옵니다. 구는 가장 가까운 관측소에 연결하고, 아직 오지 않은 날은 작년 같은 날 기온으로 계산합니다.</li>
             <li><b>요금:</b> 지역 도시가스 주택용 단가(원/MJ) × 43 MJ/m³ × 부가세 10% + 월 기본요금. 작년과 올해 모두 현재 단가로 계산해서 사용량 차이만 비교합니다.</li>
@@ -250,7 +256,10 @@ td.r, th.r{text-align:right}
 const D0 = Date.UTC(2025, 9, 1), DAY = 86400000;
 const SEASON_LAST = [0, 211], SEASON_THIS = [365, 576];       // 10/1 ~ 4/30
 const MONTHS = ["10월","11월","12월","1월","2월","3월","4월"];
-const MONTH_START = [0,31,61,92,123,151,182,212];             // 시즌 내 월 시작 오프셋
+const MONTH_START = [0,31,61,92,123,151,182,212];             // 시즌 내 월 시작 오프셋 (달력)
+/* 검침일 b 기준 사용 구간 경계(일 인덱스). k번째 구간 = (10+k)월 b일 ~ 다음 달 b일 전날 */
+const billBounds = (y, b) => Array.from({length: 8}, (_, k) => Math.round((Date.UTC(y, 9 + k, b) - D0) / DAY));
+const WATER_R0 = 0.8;   // 바닥 방열 계수 / 집 열손실 계수 비 (2026-10-31 밤 40°C 실측으로 잡은 초기값)
 const MJ_PER_M3 = 43.0, VAT = 1.1;
 
 function atToDay(at){ // "2026-10-30T08:00" -> 2025-10-01 기준 일수(실수)
@@ -323,9 +332,16 @@ function compute(readings, T, s, rate){
   const fit = fitPRISM(rs, T, cutoff);
   if (!fit) return {fit: null, rs};
   const etaOld = etaAt(s.lastTs, s.boiler.etaHigh, s.boiler.etaLow), etaNew = etaAt(s.ts, s.boiler.etaHigh, s.boiler.etaLow);
-  const tauNew = fit.tau + (s.tin - s.lastTin);
+  const water = s.mode === "water";
+  /* 실내온도 기준: 실내를 정해 두고 필요한 만큼만 가동 → τ가 실내온도를 따라 이동 */
+  const tauNew = water ? null : fit.tau + (s.tin - s.lastTin);
+  /* 난방수온도 기준: 난방수를 계속 돌리고 실내온도는 결과로 정해짐
+     집 손실 β(Tin − δ − Tout) = 바닥 방열 rβ(Tm − Tin) → 사용량 = β·r/(1+r)·(Tm − δ − Tout) */
+  const dlt = Math.min(8, Math.max(-3, s.lastTin - fit.tau)), Tm = s.ts - 5, g0 = WATER_R0 / (1 + WATER_R0);
   const old = d => fit.alpha + fit.beta * Math.max(0, fit.tau - tempAt(T, d));
-  const heatNew = d => fit.beta * (etaOld / etaNew) * Math.max(0, tauNew - tempAt(T, d));
+  const heatNew = water
+    ? d => fit.beta * (etaOld / etaNew) * g0 * Math.max(0, Tm - dlt - tempAt(T, d))
+    : d => fit.beta * (etaOld / etaNew) * Math.max(0, tauNew - tempAt(T, d));
 
   /* 설정 변경 이후 기록으로 자동 보정 */
   const after = rs.filter(r => r.x >= cutoff);
@@ -345,16 +361,30 @@ function compute(readings, T, s, rate){
   const lastX = rs.length ? rs[rs.length - 1].x : SEASON_THIS[0];
 
   const priceM3 = rate.mj * MJ_PER_M3 * VAT, basic = rate.basic * VAT;
+  const bd = Math.min(28, Math.max(1, Math.round(s.billDay || 1)));
+  const bL = billBounds(2025, bd), bT = billBounds(2026, bd);
   const mk = () => MONTHS.map(() => ({m3: 0, est: 0}));
   const last = mk(), recorded = mk(), fcst = mk();
-  for (let i = 0; i < 212; i++){
-    const mi = MONTH_START.findIndex((st, j) => i >= st && i < MONTH_START[j + 1]);
-    const d0 = SEASON_LAST[0] + i, c0 = Math.min(1, cov.get(d0) || 0);
-    last[mi].m3 += (use.get(d0) || 0) + (1 - c0) * old(d0);
-    last[mi].est += (1 - c0) * old(d0);
-    const d1 = SEASON_THIS[0] + i, c1 = Math.min(1, cov.get(d1) || 0);
-    recorded[mi].m3 += (use.get(d1) || 0);
-    if (d1 + 1 > lastX) fcst[mi].m3 += (1 - c1) * nw(d1);
+  const tout = MONTHS.map(() => 0);
+  for (let mi = 0; mi < 7; mi++){
+    for (let d0 = bL[mi]; d0 < bL[mi + 1]; d0++){
+      const c0 = Math.min(1, cov.get(d0) || 0);
+      last[mi].m3 += (use.get(d0) || 0) + (1 - c0) * old(d0);
+      last[mi].est += (1 - c0) * old(d0);
+    }
+    for (let d1 = bT[mi]; d1 < bT[mi + 1]; d1++){
+      const c1 = Math.min(1, cov.get(d1) || 0);
+      recorded[mi].m3 += (use.get(d1) || 0);
+      if (d1 + 1 > lastX) fcst[mi].m3 += (1 - c1) * nw(d1);
+      tout[mi] += tempAt(T, d1) / (bT[mi + 1] - bT[mi]);
+    }
+  }
+  /* 난방수 기준일 때 구간별 예상 실내온도와, 작년 실내온도를 지키는 데 필요한 난방수 온도 */
+  let tinMonth = null, tsNeed = null, rEff = null;
+  if (water){
+    const ge = Math.min(0.95, Math.max(0.05, k * g0)); rEff = ge / (1 - ge);
+    tinMonth = tout.map(t => (rEff * Tm + t + dlt) / (1 + rEff));
+    tsNeed = tout.map(t => (s.lastTin * (1 + rEff) - t - dlt) / rEff + 5);
   }
   const won = m => m.map(x => x.m3 > 0.05 ? x.m3 * priceM3 + basic : 0);
   const lastW = won(last), recW = recorded.map((x, i) => x.m3 > 0.05 ? x.m3 * priceM3 + basic : 0);
@@ -374,6 +404,7 @@ function compute(readings, T, s, rate){
   const sum = a => a.reduce((s, v) => s + v, 0);
   return {
     fit, rs, k, kRaw, heatPred, tauNew, etaOld, etaNew, UA, priceM3, lastX,
+    water, tout, tinMonth, tsNeed, rEff, bL, bT, bd,
     last, recorded, lastW, recW, thisW, thisM3,
     totLastW: sum(lastW), totThisW: sum(thisW), totLastM3: sum(last.map(x => x.m3)), totThisM3: sum(thisM3),
     lastEstShare: last.map(x => x.m3 > 0 ? x.est / x.m3 : 0),
@@ -404,7 +435,7 @@ const REGIONS = {
 
 /* ---------- 상태 ---------- */
 const DEFAULTS = {
-  sido:"부산", gu:"금정구", mode:"water", tin:22, ts:50, lastTin:22, lastTs:70, changedAt:"2026-10-30",
+  sido:"부산", gu:"금정구", mode:"water", tin:22, ts:50, lastTin:22, lastTs:70, billDay:1, changedAt:"2026-10-30",
   boiler:{model:"린나이 RC600-18KF", output:18000, type:"condensing", etaHigh:87, etaLow:93, src:"모델명 기준"}
 };
 let S = JSON.parse(JSON.stringify(DEFAULTS));
@@ -439,11 +470,12 @@ function fillOp(){
   $("mRoom").setAttribute("aria-pressed", S.mode === "room"); $("mWater").setAttribute("aria-pressed", S.mode === "water");
   const tinF = `<label class="fld">${S.mode==="room"?"실내 설정":"유지되는 실내"} <input class="t" type="number" id="tin" step="0.5" min="15" max="28" value="${S.tin}"> °C</label>`;
   const tsF  = `<label class="fld">${S.mode==="room"?"난방수 최고":"난방수"} <input class="t" type="number" id="ts" step="1" min="35" max="85" value="${S.ts}"> °C</label>`;
-  $("opFields").innerHTML = S.mode === "room" ? tinF + tsF : tsF + tinF;
+  $("opFields").innerHTML = S.mode === "room" ? tinF + tsF : tsF;
   const dT = +(S.tin - S.lastTin).toFixed(1), dW = S.ts - S.lastTs;
-  const tTxt = dT === 0 ? "작년과 같은 실내온도" : `작년보다 실내 ${Math.abs(dT)}°C ${dT>0?"높게":"낮게"}`;
+  const tTxt = S.mode === "water" ? `난방수 ${S.ts}°C로 계속 순환 · 실내온도는 날씨에 따라 정해짐`
+    : dT === 0 ? "작년과 같은 실내온도" : `작년보다 실내 ${Math.abs(dT)}°C ${dT>0?"높게":"낮게"}`;
   const wTxt = dW === 0 ? "난방수는 작년과 같음" : `난방수 ${Math.abs(dW)}°C ${dW>0?"높게":"낮게"}`;
-  $("opHint").innerHTML = `<b>${tTxt}</b> · ${wTxt}<br><span class="muted">작년 설정 · 실내 <input class="t" type="number" id="lastTin" step="0.5" min="15" max="28" value="${S.lastTin}" aria-label="작년 실내온도" style="width:3.6em;padding:1px 4px">°C · 난방수 <input class="t" type="number" id="lastTs" step="1" min="35" max="85" value="${S.lastTs}" aria-label="작년 난방수 온도" style="width:3.4em;padding:1px 4px">°C</span>`;
+  $("opHint").innerHTML = `<b>${tTxt}</b>` + (S.mode === "water" ? `<span id="opWater"></span>` : ` · ${wTxt}`) + `<br><span class="muted">작년 설정 · 실내 <input class="t" type="number" id="lastTin" step="0.5" min="15" max="28" value="${S.lastTin}" aria-label="작년 실내온도" style="width:3.6em;padding:1px 4px">°C · 난방수 <input class="t" type="number" id="lastTs" step="1" min="35" max="85" value="${S.lastTs}" aria-label="작년 난방수 온도" style="width:3.4em;padding:1px 4px">°C</span>`;
 }
 function setMode(m){ if(S.mode === m) return; S.mode = m; S.changedAt = nowLocal().date; saveSettings(); refresh(); }
 $("mRoom").addEventListener("click", () => setMode("room"));
@@ -456,6 +488,7 @@ $("mRoom").addEventListener("click", () => setMode("room"));
 $("mWater").addEventListener("click", () => setMode("water"));
 document.addEventListener("change", e => {
   const id = e.target.id, v = parseFloat(e.target.value);
+  if(id === "billDay"){ if(!isFinite(v)) return; const nb = Math.min(28, Math.max(1, Math.round(v))); if(nb === S.billDay) return; S.billDay = nb; saveSettings(); refresh(); return; }
   if(!["tin","ts","lastTin","lastTs"].includes(id) || !isFinite(v)) return;
   const lim = {tin:[15,28], lastTin:[15,28], ts:[35,85], lastTs:[35,85]}[id];
   S[id] = Math.min(lim[1], Math.max(lim[0], v));
@@ -590,7 +623,7 @@ function draw(res){
     return c.parsed.y ? `올해 ${man(c.parsed.y)} · ${res.recorded[c.dataIndex].m3.toFixed(1)}m³ (기록)` : "올해 아직 기록 없음";
   }};
   charts.cost = new Chart($("cCost"), {type:"bar",
-    data:{labels:MONTHS, datasets:[
+    data:{labels:MONTHS.map((m, i) => monthLabel(i)), datasets:[
       {data:res.lastW, backgroundColor:res.lastEstShare.map(s => s>0.5 ? cSoft : cLast), borderRadius:{topLeft:4,topRight:4}, borderSkipped:"bottom", maxBarThickness:26},
       {data:res.recW.map(v => v || null), backgroundColor:cThis, borderRadius:{topLeft:4,topRight:4}, borderSkipped:"bottom", maxBarThickness:26}
     ]}, options:{...o1, datasets:{bar:{categoryPercentage:.72, barPercentage:.92}}}});
@@ -610,7 +643,7 @@ function draw(res){
     data:{labels, datasets:[
       {data:lastT, borderColor:cLast, borderWidth:1.5, pointRadius:0, pointHoverRadius:3, tension:.25, spanGaps:true},
       {data:thisT, borderColor:cThis, borderWidth:2, pointRadius:0, pointHoverRadius:3, tension:.25},
-      {data:labels.map(() => res.tauNew), borderColor:cTau, borderWidth:1.5, borderDash:[5,4], pointRadius:0, pointHoverRadius:0}
+      {data:labels.map(() => res.tauNew ?? null), borderColor:cTau, borderWidth:1.5, borderDash:[5,4], pointRadius:0, pointHoverRadius:0}
     ]}, options:o2});
 }
 const redraw = () => draw(lastRes);
@@ -619,15 +652,20 @@ new MutationObserver(redraw).observe(document.documentElement, {attributes:true,
 
 /* ---------- 전체 갱신 ---------- */
 let selMonth = null; // null = 오늘이 속한 달, -1 = 겨울 전체
+const billDayOf = () => Math.min(28, Math.max(1, Math.round(S.billDay || 1)));
 function curMonthIdx(){
   const at = new Date(Date.now() + 9*3600e3).toISOString().slice(0,16);
-  const i = Math.floor(atToDay(at)) - SEASON_THIS[0];
-  if (!(i >= 0 && i < 212)) return 1;
-  return MONTH_START.findIndex((st, j) => i >= st && i < MONTH_START[j + 1]);
+  const d = Math.floor(atToDay(at)), b = billBounds(2026, billDayOf());
+  if (d < b[0]) return 0;
+  if (d >= b[7]) return 6;
+  return b.findIndex((st, j) => d >= st && d < b[j + 1]);
 }
+const md = d => { const t = dayToDate(d); return `${t.getUTCMonth()+1}/${t.getUTCDate()}`; };
+function monthLabel(mi){ return billDayOf() === 1 ? MONTHS[mi] : `${MONTHS[mi]}분`; }
+function rangeLabel(mi, bounds){ return `${md(bounds[mi])}~${md(bounds[mi+1]-1)}`; }
 function renderChips(){
   const now = curMonthIdx(), cur = selMonth == null ? now : selMonth;
-  $("mchips").innerHTML = MONTHS.map((m, i) => `<button data-m="${i}" aria-pressed="${i===cur}">${m}${i===now?" · 이번 달":""}</button>`).join("")
+  $("mchips").innerHTML = MONTHS.map((m, i) => `<button data-m="${i}" aria-pressed="${i===cur}">${monthLabel(i)}${i===now?" · 이번 달":""}</button>`).join("")
     + `<button data-m="-1" aria-pressed="${cur===-1}">겨울 전체</button>`;
   return cur;
 }
@@ -637,6 +675,7 @@ function refresh(){
   if(!KMA[stationOf()]) return;
   const b = S.boiler;
   $("boilerChip").textContent = `${b.model} · ${b.type==="condensing"?"콘덴싱":"일반"} ${b.output.toLocaleString("ko-KR")}kcal/h`;
+  if (document.activeElement !== $("billDay")) $("billDay").value = billDayOf();
   $("etaHigh").value = b.etaHigh; $("etaLow").value = b.etaLow; $("bModel").value = b.model; $("bOutput").value = b.output; $("bType").value = b.type;
   $("topInfo").textContent = `${S.sido} ${$("gu").hidden ? "" : S.gu} · 기록 ${READINGS.length}건` + (KMA_META.end ? ` · 기온 ${KMA_META.end.slice(5).replace("-","/")}까지` : "");
   renderLog();
@@ -651,7 +690,7 @@ function refresh(){
     return;
   }
   const mi = renderChips();
-  const dT = +(S.tin - S.lastTin).toFixed(1);
+  const dT = res.water ? 0 : +(S.tin - S.lastTin).toFixed(1);
   const effTxt = `효율 ${res.etaOld.toFixed(0)}→${res.etaNew.toFixed(0)}%` + (dT ? `, 실내 ${dT>0?"+":""}${dT}°C` : "");
   let lastW, lastM3, thisW, thisM3, recM3, lastEst;
   if (mi === -1){
@@ -661,12 +700,22 @@ function refresh(){
   } else {
     lastW = res.lastW[mi]; lastM3 = res.last[mi].m3; thisW = res.thisW[mi]; thisM3 = res.thisM3[mi];
     recM3 = res.recorded[mi].m3; lastEst = res.last[mi].est;
-    $("lLast").textContent = `작년 ${MONTHS[mi]}`; $("lThis").textContent = `올해 ${MONTHS[mi]} 예상`;
+    const one = res.bd === 1;
+    $("lLast").textContent = one ? `작년 ${MONTHS[mi]}` : `작년 ${rangeLabel(mi, res.bL)}`;
+    $("lThis").textContent = one ? `올해 ${MONTHS[mi]} 예상` : `올해 ${rangeLabel(mi, res.bT)} 예상`;
   }
   $("vLast").textContent = man(lastW);
   $("vLastSub").textContent = `${Math.round(lastM3)} m³ · 난방수 ${S.lastTs}°C` + (lastEst > lastM3 * 0.5 ? " · 검침 없어 추정" : "");
   $("vThis").textContent = man(thisW);
-  $("vThisSub").textContent = recM3 > 0.05 ? `${Math.round(thisM3)} m³ · 기록 ${recM3.toFixed(1)} + 예상 ${Math.max(0, thisM3 - recM3).toFixed(1)}` : `${Math.round(thisM3)} m³ · 모두 예상`;
+  $("vThisSub").textContent = (recM3 > 0.05 ? `${Math.round(thisM3)} m³ · 기록 ${recM3.toFixed(1)} + 예상 ${Math.max(0, thisM3 - recM3).toFixed(1)}` : `${Math.round(thisM3)} m³ · 모두 예상`)
+    + (res.water && mi !== -1 ? ` · 실내 약 ${res.tinMonth[mi].toFixed(0)}°C` : "");
+  if (res.water){
+    const now = curMonthIdx(), cold = 3; // 1월
+    const need = res.tsNeed[cold];
+    $("opWater").innerHTML = `<br>예상 실내: 이번 달 약 <b>${res.tinMonth[now].toFixed(0)}°C</b>, 1월 약 <b>${res.tinMonth[cold].toFixed(0)}°C</b>`
+      + (res.tinMonth[cold] < S.lastTin - 0.5 ? ` · 1월에 ${S.lastTin}°C를 지키려면 난방수 약 ${Math.round(need)}°C` : "");
+  }
+  $("billHint").textContent = res.bd === 1 ? "1일이면 달력 기준(1일~말일)으로 나눕니다." : `‘11월분’ = ${rangeLabel(1, res.bT)} 사용분처럼 검침일 기준으로 나눕니다.`;
   const d = thisW - lastW, pct = lastW ? d / lastW * 100 : 0;
   $("vDiff").innerHTML = `<span class="${d<=0?"down":"up"}">${d<=0?"▼":"▲"} ${man(Math.abs(d))}</span>`;
   $("vDiffSub").textContent = `${pct>0?"+":""}${pct.toFixed(1)}% · ${effTxt}` + (mi === -1 ? "" : ` · 겨울 전체 ${res.totThisW - res.totLastW <= 0 ? "▼" : "▲"}${man(Math.abs(res.totThisW - res.totLastW))}`);
@@ -680,11 +729,11 @@ function refresh(){
   const recent = T.slice(lastIdx - 6, lastIdx + 1).filter(v => v != null), lyr = T.slice(lastIdx - 6 - 365, lastIdx + 1 - 365).filter(v => v != null);
   const avg = a => a.reduce((s,v) => s+v, 0) / a.length;
   const diff = avg(recent) - avg(lyr);
-  $("tempNote").textContent = `최근 7일 평균 ${avg(recent).toFixed(1)}°C, 작년 같은 때보다 ${Math.abs(diff).toFixed(1)}°C ${diff>=0?"따뜻함":"추움"} · 점선(${res.tauNew.toFixed(1)}°C)보다 추운 날 난방이 필요합니다 · 기상청 관측 ${dt.getUTCMonth()+1}/${dt.getUTCDate()}까지`;
+  $("tempNote").textContent = `최근 7일 평균 ${avg(recent).toFixed(1)}°C, 작년 같은 때보다 ${Math.abs(diff).toFixed(1)}°C ${diff>=0?"따뜻함":"추움"} · ${res.water ? "난방수 기준은 외기와 상관없이 계속 순환합니다" : `점선(${res.tauNew.toFixed(1)}°C)보다 추운 날 난방이 필요합니다`} · 기상청 관측 ${dt.getUTCMonth()+1}/${dt.getUTCDate()}까지`;
 
   $("stats").innerHTML = [
     ["난방 필요 기준 (작년)", res.fit.tau.toFixed(1) + "°C"],
-    ["난방 필요 기준 (올해)", res.tauNew.toFixed(1) + "°C"],
+    res.water ? ["바닥 방열/집 손실 비 r", res.rEff.toFixed(2)] : ["난방 필요 기준 (올해)", res.tauNew.toFixed(1) + "°C"],
     ["열손실 β", res.fit.beta.toFixed(3) + " m³/°C·일"],
     ["온수·취사 α", res.fit.alpha.toFixed(2) + " m³/일"],
     ["집 열손실계수 UA", Math.round(res.UA) + " W/K"],
