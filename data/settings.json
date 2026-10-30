@@ -3,10 +3,10 @@
  "gu": "연제구",
  "mode": "water",
  "tin": 22,
- "ts": 45,
+ "ts": 40,
  "lastTin": 22,
  "lastTs": 70,
- "changedAt": "2026-10-30",
+ "changedAt": "2026-10-31",
  "boiler": {
   "model": "린나이 RC600-18KF",
   "output": 18000,
