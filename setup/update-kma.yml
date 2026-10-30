@@ -1,0 +1,33 @@
+name: 기상청 기온 갱신
+
+on:
+  schedule:
+    - cron: "41 15 * * *"   # 매일 00:41 (한국시간)
+  workflow_dispatch: {}     # Actions 탭에서 수동 실행
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-write
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 기상청 일평균기온 받기
+        run: python scripts/update_kma.py
+      - name: 바뀐 내용 커밋
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/kma.json
+          if git diff --cached --quiet; then echo "변경 없음"; exit 0; fi
+          git commit -m "기상청 기온 갱신 $(TZ=Asia/Seoul date +%F)"
+          git pull --rebase
+          git push

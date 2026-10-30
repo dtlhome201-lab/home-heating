@@ -1,0 +1,18 @@
+{
+ "sido": "부산",
+ "gu": "금정구",
+ "mode": "water",
+ "tin": 22,
+ "ts": 50,
+ "lastTin": 22,
+ "lastTs": 70,
+ "changedAt": "2026-10-30",
+ "boiler": {
+  "model": "린나이 RC600-18KF",
+  "output": 18000,
+  "type": "condensing",
+  "etaHigh": 87,
+  "etaLow": 93,
+  "src": "모델명 기준"
+ }
+}
