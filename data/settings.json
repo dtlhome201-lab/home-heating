@@ -1,13 +1,13 @@
 {
  "sido": "부산",
  "gu": "연제구",
- "mode": "room",
+ "mode": "water",
  "tin": 21,
  "ts": 70,
  "lastTin": 22,
  "lastTs": 70,
  "billDay": 10,
- "changedAt": "2026-11-03",
+ "changedAt": "2026-11-05",
  "boiler": {
   "model": "린나이 RC600-18KF",
   "output": 18000,
